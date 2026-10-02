@@ -13,6 +13,8 @@ RestartSec=3
 # sockets (net.ipv4.ping_group_range) and traceroute uses UDP, so neither
 # needs root or CAP_NET_RAW.
 DynamicUser=yes
+# Writable /var/lib/oglinda for the cached world latency ($STATE_DIRECTORY).
+StateDirectory=oglinda
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

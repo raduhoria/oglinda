@@ -87,9 +87,27 @@ input { flex: 1 1 220px; min-width: 0; }
 }
 .out .err { color: var(--err); }
 
+.table-wrap { overflow-x: auto; margin-top: 12px; }
+table.world { width: 100%; border-collapse: collapse; font-size: 14px; }
+.world th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 12px;
+  text-transform: uppercase; letter-spacing: .04em; padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.world td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.world tr:last-child td { border-bottom: 0; }
+.world .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.world .cc { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.world .net { color: var(--muted); }
+.world .lat { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.world .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--accent); opacity: .7; }
+.world .warn { color: var(--err); }
+#world-meta { margin: 10px 0 0; }
+
 footer { padding: 24px 16px 40px; }
 
 @media (max-width: 560px) {
+  .world .net { display: none; }
+  .world .bar { display: none; }
   .meters { grid-template-columns: 1fr; }
   .big { font-size: 24px; }
 }

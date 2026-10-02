@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -44,11 +45,25 @@ type config struct {
 	speedStreams  int // parallel transfers per client
 	speedClientMB int // per client, per hour
 	speedTotalMB  int // all clients, per minute
+
+	worldPlaces     []worldPlace
+	worldTarget     string
+	worldInterval   time.Duration
+	globalpingToken string
+	globalpingAPI   string
+	stateDir        string
 }
 
 func env(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
 		return v
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil {
+		return d
 	}
 	return def
 }
@@ -81,7 +96,7 @@ func parsePrefixes(s string) ([]netip.Prefix, error) {
 
 func loadConfig() (*config, error) {
 	c := &config{}
-	var trusted, blocked string
+	var trusted, blocked, places string
 	flag.StringVar(&c.listen, "listen", env("LG_LISTEN", "127.0.0.1:8090"), "address to listen on")
 	flag.StringVar(&trusted, "trusted-proxy", env("LG_TRUSTED_PROXY", "127.0.0.1,::1"), "proxies whose X-Forwarded-For is trusted")
 	flag.StringVar(&c.brand, "brand", env("LG_BRAND", "Looking Glass"), "name shown in the header")
@@ -101,7 +116,13 @@ func loadConfig() (*config, error) {
 	flag.IntVar(&c.speedStreams, "speed-streams", envInt("LG_SPEED_STREAMS", 4), "parallel speed transfers per client")
 	flag.IntVar(&c.speedClientMB, "speed-client-mb", envInt("LG_SPEED_CLIENT_MB", 500), "speed test traffic per client per hour, MiB")
 	flag.IntVar(&c.speedTotalMB, "speed-total-mb", envInt("LG_SPEED_TOTAL_MB", 1000), "speed test traffic for all clients per minute, MiB")
+	flag.StringVar(&places, "world", env("LG_WORLD_LOCATIONS", ""), "Globalping locations to ping this server from, \"Label=magic;...\" (empty disables)")
+	flag.StringVar(&c.worldTarget, "world-target", env("LG_WORLD_TARGET", ""), "address the world probes ping (default: the test IPv4)")
+	flag.DurationVar(&c.worldInterval, "world-interval", envDuration("LG_WORLD_INTERVAL", 3*time.Hour), "how often to re-measure world latency (at least 30m)")
+	flag.StringVar(&c.globalpingToken, "globalping-token", env("LG_GLOBALPING_TOKEN", ""), "optional Globalping API token for a higher quota")
+	flag.StringVar(&c.stateDir, "state-dir", env("LG_STATE_DIR", os.Getenv("STATE_DIRECTORY")), "directory for cached measurements (empty: memory only)")
 	flag.Parse()
+	c.globalpingAPI = globalpingAPI
 
 	for name, v := range map[string]int{
 		"per-minute": c.perMinute, "max-jobs": c.maxJobs, "speed-max-mb": c.speedMaxMB,
@@ -120,6 +141,15 @@ func loadConfig() (*config, error) {
 	}
 
 	var err error
+	if c.worldPlaces, err = parseWorldPlaces(places); err != nil {
+		return nil, fmt.Errorf("world: %w", err)
+	}
+	if c.worldTarget == "" {
+		c.worldTarget = c.testIPv4
+	}
+	if len(c.worldPlaces) > 0 && c.worldInterval < 30*time.Minute {
+		return nil, fmt.Errorf("world-interval must be at least 30m")
+	}
 	if c.trustedProxy, err = parsePrefixes(trusted); err != nil {
 		return nil, fmt.Errorf("trusted-proxy: %w", err)
 	}
@@ -143,6 +173,7 @@ type server struct {
 	// MiB budgets for speed test traffic, per client and for all clients.
 	speedClient *limiter
 	speedTotal  *limiter
+	world       *world
 }
 
 func (s *server) isTrustedProxy(peer netip.Addr) bool {
@@ -372,6 +403,7 @@ func (s *server) handler() http.Handler {
 	mux.Handle("GET /", http.FileServerFS(static))
 	mux.HandleFunc("GET /api/info", s.handleInfo)
 	mux.HandleFunc("GET /api/run", s.handleRun)
+	mux.HandleFunc("GET /api/world", s.handleWorld)
 	mux.HandleFunc("GET /speed/ping", s.handleSpeedPing)
 	mux.HandleFunc("GET /speed/down", s.handleSpeedDown)
 	mux.HandleFunc("POST /speed/up", s.handleSpeedUp)
@@ -390,6 +422,7 @@ func newServer(cfg *config) *server {
 		speedSem:    make(semaphore, cfg.speedJobs),
 		speedClient: newLimiter(float64(cfg.speedClientMB)/60, cfg.speedClientMB),
 		speedTotal:  newLimiter(float64(cfg.speedTotalMB), cfg.speedTotalMB),
+		world:       newWorld(cfg),
 	}
 }
 
@@ -400,6 +433,10 @@ func main() {
 		log.Fatal(err)
 	}
 	s := newServer(cfg)
+	if s.world.enabled() {
+		go s.world.run(context.Background())
+		log.Printf("world latency from %d locations every %s", len(cfg.worldPlaces), cfg.worldInterval)
+	}
 
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {

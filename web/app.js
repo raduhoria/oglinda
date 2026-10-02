@@ -10,6 +10,12 @@ const T = {
     netHint: "Defaults to your own IP — see the route from the server back to you.",
     footer: "Public tests only. Private and reserved addresses are refused.",
     measuring: "Measuring…", done: "Done", jitter: "jitter",
+    worldTitle: "Latency from around the world",
+    worldHint: "Ping to this server from probes in other cities, measured periodically.",
+    wPlace: "Location", wNetwork: "Network", wLatency: "Latency", wLoss: "Loss",
+    wPending: "The first measurement is running. Check back in a few minutes.",
+    wMeasured: "Measured {ago}, refreshed every {every}", wData: "data",
+    ago: { now: "just now", min: "{n} min ago", h: "{n} h ago" }, hours: "{n} h", minutes: "{n} min",
     err: {
       bad_target: "Enter a valid IP address or hostname.",
       not_public: "Only public addresses can be tested.",
@@ -29,6 +35,12 @@ const T = {
     netHint: "Implicit e IP-ul tău — vezi ruta de la server înapoi către tine.",
     footer: "Doar teste publice. Adresele private și rezervate sunt refuzate.",
     measuring: "Se măsoară…", done: "Gata", jitter: "jitter",
+    worldTitle: "Latența din alte orașe",
+    worldHint: "Ping către acest server din sonde aflate în alte orașe, măsurat periodic.",
+    wPlace: "Locație", wNetwork: "Rețea", wLatency: "Latență", wLoss: "Pierderi",
+    wPending: "Prima măsurătoare e în curs. Revino în câteva minute.",
+    wMeasured: "Măsurat {ago}, actualizat la fiecare {every}", wData: "date",
+    ago: { now: "chiar acum", min: "acum {n} min", h: "acum {n} h" }, hours: "{n} h", minutes: "{n} min",
     err: {
       bad_target: "Introdu o adresă IP sau un hostname valid.",
       not_public: "Se pot testa doar adrese publice.",
@@ -44,6 +56,7 @@ const T = {
 const $ = (id) => document.getElementById(id);
 let lang = "en";
 let info = null;
+let world = null;
 
 function pickLang() {
   try {
@@ -61,6 +74,7 @@ function setLang(l) {
     if (typeof v === "string") el.textContent = v;
   });
   document.querySelectorAll("[data-lang]").forEach((b) => b.classList.toggle("on", b.dataset.lang === l));
+  if (world) renderWorld();
   try { localStorage.setItem("lg-lang", l); } catch (_) { /* ignore */ }
 }
 
@@ -92,6 +106,76 @@ function copyable(el) {
       setTimeout(() => el.classList.remove("copied"), 1200);
     } catch (_) { /* clipboard blocked */ }
   });
+}
+
+// ---- latency from other cities (measured by the server, read from its cache) ----
+
+const fill = (tpl, vars) => tpl.replace(/\{(\w+)\}/g, (_, k) => vars[k]);
+
+function ago(iso) {
+  const min = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  const a = T[lang].ago;
+  if (!(min >= 1)) return a.now;
+  return min < 60 ? fill(a.min, { n: min }) : fill(a.h, { n: Math.round(min / 60) });
+}
+
+function every(minutes) {
+  return minutes % 60 === 0 ? fill(T[lang].hours, { n: minutes / 60 }) : fill(T[lang].minutes, { n: minutes });
+}
+
+function cell(row, text, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  if (text !== undefined) td.textContent = text;
+  row.appendChild(td);
+  return td;
+}
+
+function renderWorld() {
+  const tbody = $("world-rows");
+  const meta = $("world-meta");
+  tbody.textContent = "";
+  meta.textContent = "";
+  const rows = [...(world.results || [])].sort((a, b) => a.avg - b.avg);
+  if (!rows.length) {
+    meta.textContent = T[lang].wPending;
+    return;
+  }
+  const top = Math.max(...rows.map((r) => r.avg), 1);
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    const place = cell(tr, r.label);
+    const cc = document.createElement("span");
+    cc.className = "cc";
+    cc.textContent = r.country;
+    place.appendChild(cc);
+    cell(tr, r.network, "net");
+    const lat = cell(tr, undefined, "num");
+    const wrap = document.createElement("span");
+    wrap.className = "lat";
+    const bar = document.createElement("span");
+    bar.className = "bar";
+    bar.style.width = Math.max(2, Math.round((r.avg / top) * 80)) + "px";
+    wrap.append(bar, document.createTextNode(r.avg.toFixed(1) + " ms"));
+    lat.appendChild(wrap);
+    cell(tr, Math.round(r.loss) + "%", "num" + (r.loss > 0 ? " warn" : ""));
+    tbody.appendChild(tr);
+  }
+  meta.append(fill(T[lang].wMeasured, { ago: ago(world.measuredAt), every: every(world.intervalMinutes) }) + " · " + T[lang].wData + ": ");
+  const a = document.createElement("a");
+  a.href = "https://globalping.io";
+  a.rel = "noopener";
+  a.textContent = "Globalping";
+  meta.appendChild(a);
+}
+
+async function loadWorld() {
+  const r = await fetch("api/world", { cache: "no-store" });
+  const data = await r.json();
+  if (!data.enabled) return;
+  world = data;
+  $("world").hidden = false;
+  renderWorld();
 }
 
 // ---- network tests (server-sent events read through fetch so that HTTP
@@ -294,4 +378,5 @@ document.addEventListener("DOMContentLoaded", () => {
   loadInfo().catch(() => {
     $("speed-status").textContent = errText("network");
   });
+  loadWorld().catch(() => {});
 });

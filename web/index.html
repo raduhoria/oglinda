@@ -27,6 +27,25 @@
     <div class="card"><span class="k" data-t="yourip">Your IP</span><span class="v mono" id="yourip">—</span></div>
   </section>
 
+  <section class="panel" id="world" hidden>
+    <h2 data-t="worldTitle">Latency from around the world</h2>
+    <p class="muted" data-t="worldHint">Ping to this server from probes in other cities, measured periodically.</p>
+    <div class="table-wrap">
+      <table class="world">
+        <thead>
+          <tr>
+            <th data-t="wPlace">Location</th>
+            <th class="net" data-t="wNetwork">Network</th>
+            <th class="num" data-t="wLatency">Latency</th>
+            <th class="num" data-t="wLoss">Loss</th>
+          </tr>
+        </thead>
+        <tbody id="world-rows"></tbody>
+      </table>
+    </div>
+    <p class="muted" id="world-meta"></p>
+  </section>
+
   <section class="panel">
     <h2 data-t="speedTitle">Speed test from your browser</h2>
     <p class="muted" data-t="speedHint">Measures latency, download and upload between your browser and this server. No software needed.</p>

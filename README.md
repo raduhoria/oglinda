@@ -6,6 +6,9 @@ A small, self-contained looking glass for hosting providers.
   The target defaults to the visitor's own IP, so they see the route back to them.
 - **Browser speed test**: latency, jitter, download and upload between the visitor's
   browser and your server, over parallel requests like common speed tests. Nothing to install.
+- **Latency from other cities** (optional): the server periodically has
+  [Globalping](https://globalping.io) probes ping it from places you choose, caches
+  the result and shows it as a table.
 - Location and test IPs, with click-to-copy.
 - English and Romanian interface.
 
@@ -27,6 +30,7 @@ safe to run directly on a production host:
 | Strict browser policy | Strict CSP (`default-src 'none'`, no inline code), `nosniff`, no referrer, no framing. |
 | Request protection | Resource-consuming endpoints refuse cross-origin browser requests. GET and HEAD requests cannot carry a body. Uploads must deliver each 64 KiB block (or the final partial block) within five seconds. |
 | Small | One static Go binary with the web UI embedded. Standard library only, no third-party dependencies. |
+| No visitor-triggered outside calls | The optional world latency is measured by the server on a timer and served from a cache. Visitors cannot spend the Globalping quota, and the page never contacts a third party. |
 | No leaks | Internal hops (e.g. your provider's `10.x` routers) can be masked in traceroute output. |
 
 ## Requirements
@@ -89,6 +93,21 @@ Every option is an environment variable (see `deploy/oglinda.env.example`) or a 
 | `LG_SPEED_STREAMS` | `4` | Parallel speed transfers per client (at most `LG_SPEED_JOBS`) |
 | `LG_SPEED_CLIENT_MB` | `500` | Speed test traffic per client per hour, MiB |
 | `LG_SPEED_TOTAL_MB` | `1000` | Speed test traffic for all clients per minute, MiB |
+| `LG_WORLD_LOCATIONS` | | `Label=magic;…` Globalping locations to ping this server from. Empty disables |
+| `LG_WORLD_TARGET` | `LG_IPV4` | Address the probes ping |
+| `LG_WORLD_INTERVAL` | `3h` | How often to re-measure (at least `30m`) |
+| `LG_GLOBALPING_TOKEN` | | Optional token for a higher Globalping quota |
+| `LG_STATE_DIR` | `$STATE_DIRECTORY` | Where the last world measurement is saved, so restarts do not re-measure |
+
+### World latency
+
+Each location is measured with 3 probes; the page shows the median of their average
+round-trip times, the network of that probe and the mean packet loss. A run costs
+3 tests per location (12 locations: 36 tests), well inside Globalping's free hourly
+quota. If a location fails, its previous row is kept; on a rate-limit response the
+run stops and is retried at the next interval. Globalping's network classification
+is not perfect: `+eyeball-network` usually, but not always, selects residential
+networks, which is why the page shows each probe's network.
 
 Traffic budgets are token buckets: each starts with the configured MiB allowance
 and replenishes at the stated rate. Transfers reserve their declared size up
@@ -102,6 +121,7 @@ five-second block deadline.
 |---|---|
 | `GET /api/info` | Server info and the caller's IP |
 | `GET /api/run?tool=ping\|traceroute&family=4\|6&target=…` | Server-sent events: `target`, `line`…, then `done` or `error` |
+| `GET /api/world` | Cached latency from other cities, or `{"enabled":false}` |
 | `GET /speed/ping` | Empty response, for RTT |
 | `GET /speed/down?mb=N` | N MiB of random data |
 | `POST /speed/up` | Discards the body, returns its size. Requires `Content-Length` |
