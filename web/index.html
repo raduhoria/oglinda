@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Looking Glass</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%232f6fed' stroke-width='2'/%3E%3C/svg%3E">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <div class="wrap bar">
+    <a id="brand" class="brand">Looking Glass</a>
+    <div class="lang">
+      <button type="button" data-lang="ro">RO</button>
+      <button type="button" data-lang="en">EN</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="cards">
+    <div class="card"><span class="k" data-t="location">Location</span><span class="v" id="location">—</span></div>
+    <div class="card"><span class="k" data-t="ipv4">Test IPv4</span><span class="v mono copy" id="ipv4">—</span></div>
+    <div class="card" id="ipv6card"><span class="k" data-t="ipv6">Test IPv6</span><span class="v mono copy" id="ipv6">—</span></div>
+    <div class="card"><span class="k" data-t="yourip">Your IP</span><span class="v mono" id="yourip">—</span></div>
+  </section>
+
+  <section class="panel">
+    <h2 data-t="speedTitle">Speed test from your browser</h2>
+    <p class="muted" data-t="speedHint">Measures latency, download and upload between your browser and this server. No software needed.</p>
+    <div class="meters">
+      <div class="meter"><span class="k" data-t="latency">Latency</span><span class="big" id="m-lat">—</span><span class="unit">ms</span><span class="sub" id="m-jit"></span></div>
+      <div class="meter"><span class="k" data-t="download">Download</span><span class="big" id="m-down">—</span><span class="unit">Mbit/s</span></div>
+      <div class="meter"><span class="k" data-t="upload">Upload</span><span class="big" id="m-up">—</span><span class="unit">Mbit/s</span></div>
+    </div>
+    <button type="button" id="speed" class="primary" data-t="start">Start test</button>
+    <span class="status" id="speed-status"></span>
+  </section>
+
+  <section class="panel">
+    <h2 data-t="netTitle">Network tests from the server</h2>
+    <form id="run" autocomplete="off">
+      <div class="row">
+        <select id="tool" aria-label="tool">
+          <option value="ping">ping</option>
+          <option value="traceroute">traceroute</option>
+        </select>
+        <select id="family" aria-label="IP version">
+          <option value="4">IPv4</option>
+          <option value="6">IPv6</option>
+        </select>
+        <input id="target" maxlength="253" spellcheck="false" placeholder="1.1.1.1 / example.com">
+        <button type="submit" class="primary" id="go" data-t="run">Run</button>
+      </div>
+      <p class="muted" data-t="netHint">Defaults to your own IP — see the route from the server back to you.</p>
+    </form>
+    <pre id="out" class="out" hidden></pre>
+  </section>
+</main>
+
+<footer class="wrap muted">
+  <span data-t="footer">Public tests only. Private and reserved addresses are refused.</span>
+  · <a href="https://github.com/raduhoria/oglinda" rel="noopener">oglinda</a>
+</footer>
+</body>
+</html>

@@ -1,0 +1,3 @@
+/oglinda
+*.env
+!deploy/*.env.example
