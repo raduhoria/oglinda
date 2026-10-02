@@ -41,6 +41,7 @@ type config struct {
 	maxJobs       int
 	speedMaxMB    int
 	speedJobs     int
+	speedStreams  int // parallel transfers per client
 	speedClientMB int // per client, per hour
 	speedTotalMB  int // all clients, per minute
 }
@@ -96,14 +97,16 @@ func loadConfig() (*config, error) {
 	flag.IntVar(&c.perMinute, "per-minute", envInt("LG_PER_MINUTE", 6), "network tests per client per minute")
 	flag.IntVar(&c.maxJobs, "max-jobs", envInt("LG_MAX_JOBS", 4), "concurrent network tests, all clients")
 	flag.IntVar(&c.speedMaxMB, "speed-max-mb", envInt("LG_SPEED_MAX_MB", 100), "largest speed test transfer, MiB")
-	flag.IntVar(&c.speedJobs, "speed-jobs", envInt("LG_SPEED_JOBS", 3), "concurrent speed transfers, all clients")
+	flag.IntVar(&c.speedJobs, "speed-jobs", envInt("LG_SPEED_JOBS", 8), "concurrent speed transfers, all clients")
+	flag.IntVar(&c.speedStreams, "speed-streams", envInt("LG_SPEED_STREAMS", 4), "parallel speed transfers per client")
 	flag.IntVar(&c.speedClientMB, "speed-client-mb", envInt("LG_SPEED_CLIENT_MB", 500), "speed test traffic per client per hour, MiB")
 	flag.IntVar(&c.speedTotalMB, "speed-total-mb", envInt("LG_SPEED_TOTAL_MB", 1000), "speed test traffic for all clients per minute, MiB")
 	flag.Parse()
 
 	for name, v := range map[string]int{
 		"per-minute": c.perMinute, "max-jobs": c.maxJobs, "speed-max-mb": c.speedMaxMB,
-		"speed-jobs": c.speedJobs, "speed-client-mb": c.speedClientMB, "speed-total-mb": c.speedTotalMB,
+		"speed-jobs": c.speedJobs, "speed-streams": c.speedStreams,
+		"speed-client-mb": c.speedClientMB, "speed-total-mb": c.speedTotalMB,
 	} {
 		if v < 1 {
 			return nil, fmt.Errorf("%s must be at least 1", name)
@@ -111,6 +114,9 @@ func loadConfig() (*config, error) {
 	}
 	if c.speedMaxMB > c.speedClientMB || c.speedMaxMB > c.speedTotalMB {
 		return nil, fmt.Errorf("speed-max-mb must not exceed speed-client-mb or speed-total-mb")
+	}
+	if c.speedStreams > c.speedJobs {
+		return nil, fmt.Errorf("speed-streams must not exceed speed-jobs")
 	}
 
 	var err error
@@ -193,15 +199,16 @@ func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		family = 6
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"brand":      s.cfg.brand,
-		"brandURL":   s.cfg.brandURL,
-		"location":   s.cfg.location,
-		"datacenter": s.cfg.datacenter,
-		"ipv4":       s.cfg.testIPv4,
-		"ipv6":       s.cfg.testIPv6,
-		"tools":      []string{"ping", "traceroute"},
-		"speedMaxMB": s.cfg.speedMaxMB,
-		"client":     map[string]any{"ip": ip.String(), "family": family},
+		"brand":        s.cfg.brand,
+		"brandURL":     s.cfg.brandURL,
+		"location":     s.cfg.location,
+		"datacenter":   s.cfg.datacenter,
+		"ipv4":         s.cfg.testIPv4,
+		"ipv6":         s.cfg.testIPv6,
+		"tools":        []string{"ping", "traceroute"},
+		"speedMaxMB":   s.cfg.speedMaxMB,
+		"speedStreams": max(1, s.cfg.speedStreams),
+		"client":       map[string]any{"ip": ip.String(), "family": family},
 	})
 }
 
@@ -371,21 +378,28 @@ func (s *server) handler() http.Handler {
 	return securityHeaders(s.requestGuards(mux))
 }
 
+func newServer(cfg *config) *server {
+	// A browser speed test is a probe plus one request per stream, for both
+	// download and upload, so the request rate grows with the stream count.
+	streams := max(1, cfg.speedStreams)
+	return &server{
+		cfg:         cfg,
+		limit:       newLimiter(float64(cfg.perMinute), cfg.perMinute),
+		jobs:        make(semaphore, cfg.maxJobs),
+		speedLimit:  newLimiterN(float64(6*streams), 6*streams, streams),
+		speedSem:    make(semaphore, cfg.speedJobs),
+		speedClient: newLimiter(float64(cfg.speedClientMB)/60, cfg.speedClientMB),
+		speedTotal:  newLimiter(float64(cfg.speedTotalMB), cfg.speedTotalMB),
+	}
+}
+
 func main() {
 	log.SetFlags(0)
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := &server{
-		cfg:         cfg,
-		limit:       newLimiter(float64(cfg.perMinute), cfg.perMinute),
-		jobs:        make(semaphore, cfg.maxJobs),
-		speedLimit:  newLimiter(6, 6),
-		speedSem:    make(semaphore, cfg.speedJobs),
-		speedClient: newLimiter(float64(cfg.speedClientMB)/60, cfg.speedClientMB),
-		speedTotal:  newLimiter(float64(cfg.speedTotalMB), cfg.speedTotalMB),
-	}
+	s := newServer(cfg)
 
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {

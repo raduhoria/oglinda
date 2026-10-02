@@ -179,19 +179,48 @@ async function measureLatency() {
   return { median, jitter: jitter / (samples.length - 1) };
 }
 
-async function download(mb, onProgress) {
+// Transfers run on several parallel requests, like common speed tests: a
+// single stream rarely fills a fast line at tens of milliseconds of latency.
+// The total size is split across the streams, so a test costs the same
+// traffic budget whatever the stream count.
+function streamCount() {
+  return Math.max(1, Math.min(8, (info && info.speedStreams) || 1));
+}
+
+function split(totalMB) {
+  const n = Math.min(streamCount(), totalMB);
+  return { n, each: Math.max(1, Math.floor(totalMB / n)) };
+}
+
+function httpError(r) {
+  return new Error(r.status === 429 ? "rate_limited" : "busy");
+}
+
+// Runs one transfer per stream and reports the combined rate. Bytes from a
+// stream that fails midway still count; it fails only if every stream does.
+async function parallel(totalMB, one, onProgress) {
+  const { n, each } = split(totalMB);
   const t0 = performance.now();
-  const r = await fetch("speed/down?mb=" + mb, { cache: "no-store" });
-  if (!r.ok) throw new Error(r.status === 429 ? "rate_limited" : "busy");
-  const reader = r.body.getReader();
   let bytes = 0;
+  const add = (k) => {
+    bytes += k;
+    if (onProgress) onProgress(mbps(bytes, performance.now() - t0));
+  };
+  const results = await Promise.allSettled(Array.from({ length: n }, () => one(each, add)));
+  const ms = performance.now() - t0;
+  if (results.every((r) => r.status === "rejected")) throw results[0].reason;
+  return { bytes, ms };
+}
+
+async function downloadOne(mb, add) {
+  const r = await fetch("speed/down?mb=" + mb, { cache: "no-store" });
+  if (!r.ok) throw httpError(r);
+  const reader = r.body.getReader();
   for (;;) {
     const { value, done } = await reader.read();
-    if (done) break;
-    bytes += value.length;
-    onProgress(mbps(bytes, performance.now() - t0));
+    if (done) return;
+    add(value.length);
   }
-  return { bytes, ms: performance.now() - t0 };
 }
 
 let randomChunk = null;
@@ -205,13 +234,13 @@ function uploadBlob(mb) {
   return new Blob(Array(mb).fill(randomChunk), { type: "application/octet-stream" });
 }
 
-async function upload(mb) {
+// fetch cannot report upload progress, so a stream counts once it is done.
+async function uploadOne(mb, add) {
   const body = uploadBlob(mb);
-  const t0 = performance.now();
   const r = await fetch("speed/up", { method: "POST", body, cache: "no-store" });
-  if (!r.ok) throw new Error(r.status === 429 ? "rate_limited" : "busy");
+  if (!r.ok) throw httpError(r);
   await r.text();
-  return { bytes: body.size, ms: performance.now() - t0 };
+  add(body.size);
 }
 
 // Run a short probe, then size the real transfer to last about six seconds.
@@ -236,14 +265,14 @@ async function speedTest() {
     $("m-jit").textContent = `${T[lang].jitter} ${lat.jitter.toFixed(1)} ms`;
 
     const show = (v) => ($("m-down").textContent = fmt(v));
-    const dProbe = await download(Math.min(10, max), show);
-    const d = await download(nextSize(dProbe, max), show);
+    const dProbe = await parallel(Math.min(16, max), downloadOne, show);
+    const d = await parallel(nextSize(dProbe, max), downloadOne, show);
     show(mbps(d.bytes, d.ms));
 
     await sleep(200);
-    const uProbe = await upload(Math.min(4, max));
+    const uProbe = await parallel(Math.min(8, max), uploadOne);
     $("m-up").textContent = fmt(mbps(uProbe.bytes, uProbe.ms));
-    const u = await upload(nextSize(uProbe, max));
+    const u = await parallel(nextSize(uProbe, max), uploadOne);
     $("m-up").textContent = fmt(mbps(u.bytes, u.ms));
 
     status.textContent = T[lang].done;

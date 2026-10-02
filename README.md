@@ -5,7 +5,7 @@ A small, self-contained looking glass for hosting providers.
 - **ping** and **traceroute** from your server to any public address, streamed live.
   The target defaults to the visitor's own IP, so they see the route back to them.
 - **Browser speed test**: latency, jitter, download and upload between the visitor's
-  browser and your server. Nothing to install.
+  browser and your server, over parallel requests like common speed tests. Nothing to install.
 - Location and test IPs, with click-to-copy.
 - English and Romanian interface.
 
@@ -22,7 +22,7 @@ safe to run directly on a production host:
 | Resolve, then run | The target is parsed or resolved to an IP first; only that IP is passed to the tool, after `--`. Hostnames cannot inject options, and DNS cannot change between check and use. |
 | Public targets only | Private, loopback, link-local, multicast, CGNAT, documentation, benchmarking and other reserved ranges are refused, for IPv4 and IPv6. You can block extra prefixes (`LG_BLOCK`). |
 | No privileges | Runs as a systemd `DynamicUser` with an empty capability set. ping uses unprivileged ICMP sockets, traceroute uses UDP. |
-| Bounded | Per-client token bucket (IPv6 grouped by /64), one job per client at a time, global job cap, hard timeouts on reading requests and on every test, output line cap. Speed transfers have their own size and concurrency limits, plus traffic budgets per client and for the whole server. |
+| Bounded | Per-client token bucket (IPv6 grouped by /64), one network test per client at a time (speed transfers: `LG_SPEED_STREAMS`), global job cap, hard timeouts on reading requests and on every test, output line cap. Speed transfers have their own size and concurrency limits, plus traffic budgets per client and for the whole server. |
 | Honest client IP | `X-Forwarded-For` is trusted only from configured proxies, and only its right-most entry. |
 | Strict browser policy | Strict CSP (`default-src 'none'`, no inline code), `nosniff`, no referrer, no framing. |
 | Request protection | Resource-consuming endpoints refuse cross-origin browser requests. GET and HEAD requests cannot carry a body. Uploads must deliver each 64 KiB block (or the final partial block) within five seconds. |
@@ -85,7 +85,8 @@ Every option is an environment variable (see `deploy/oglinda.env.example`) or a 
 | `LG_PER_MINUTE` | `6` | Network tests per client per minute |
 | `LG_MAX_JOBS` | `4` | Concurrent network tests, all clients |
 | `LG_SPEED_MAX_MB` | `100` | Largest speed test transfer, MiB |
-| `LG_SPEED_JOBS` | `3` | Concurrent speed transfers, all clients |
+| `LG_SPEED_JOBS` | `8` | Concurrent speed transfers, all clients |
+| `LG_SPEED_STREAMS` | `4` | Parallel speed transfers per client (at most `LG_SPEED_JOBS`) |
 | `LG_SPEED_CLIENT_MB` | `500` | Speed test traffic per client per hour, MiB |
 | `LG_SPEED_TOTAL_MB` | `1000` | Speed test traffic for all clients per minute, MiB |
 

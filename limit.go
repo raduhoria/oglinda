@@ -5,26 +5,35 @@ import (
 	"time"
 )
 
-// limiter is a per-key token bucket plus a per-key "one job at a time" lock.
-// Idle buckets are dropped only after their spent tokens have fully refilled.
+// limiter is a per-key token bucket plus a per-key cap on jobs running at
+// once. Idle buckets are dropped only after their spent tokens have fully
+// refilled.
 type limiter struct {
-	mu      sync.Mutex
-	rate    float64 // tokens per second
-	burst   float64
-	buckets map[string]*bucket
+	mu        sync.Mutex
+	rate      float64 // tokens per second
+	burst     float64
+	maxActive int
+	buckets   map[string]*bucket
 }
 
 type bucket struct {
 	tokens float64
 	last   time.Time
-	busy   bool
+	active int
 }
 
+// newLimiter allows one job per key at a time.
 func newLimiter(perMinute float64, burst int) *limiter {
+	return newLimiterN(perMinute, burst, 1)
+}
+
+// newLimiterN allows up to maxActive jobs per key at a time.
+func newLimiterN(perMinute float64, burst, maxActive int) *limiter {
 	l := &limiter{
-		rate:    perMinute / 60,
-		burst:   float64(burst),
-		buckets: make(map[string]*bucket),
+		rate:      perMinute / 60,
+		burst:     float64(burst),
+		maxActive: maxActive,
+		buckets:   make(map[string]*bucket),
 	}
 	go l.gc()
 	return l
@@ -44,22 +53,23 @@ func (l *limiter) refill(key string) *bucket {
 	return b
 }
 
-// acquire takes a token and marks key busy. It fails if the bucket is empty
-// or the key already has a job running. Call release when the job ends.
+// acquire takes a token and starts a job for key. It fails if the bucket is
+// empty or key already has maxActive jobs running. Call release when the job
+// ends.
 func (l *limiter) acquire(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b := l.refill(key)
-	if b.busy || b.tokens < 1 {
+	if b.active >= l.maxActive || b.tokens < 1 {
 		return false
 	}
 	b.tokens--
-	b.busy = true
+	b.active++
 	return true
 }
 
 // spend takes n tokens from key's bucket, or none if it holds fewer.
-// It is for budgets (e.g. MiB transferred) and ignores the busy flag.
+// It is for budgets (e.g. MiB transferred) and ignores running jobs.
 func (l *limiter) spend(key string, n float64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,8 +92,8 @@ func (l *limiter) refund(key string, n float64) {
 func (l *limiter) release(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if b, ok := l.buckets[key]; ok {
-		b.busy = false
+	if b, ok := l.buckets[key]; ok && b.active > 0 {
+		b.active--
 	}
 }
 
@@ -102,7 +112,7 @@ func (l *limiter) collect(now time.Time) {
 		// a fresh burst on the next request. Evict only when recreating the
 		// bucket cannot increase the tokens available to the client.
 		refilled := b.tokens + now.Sub(b.last).Seconds()*l.rate
-		if !b.busy && b.last.Before(cutoff) && refilled >= l.burst {
+		if b.active == 0 && b.last.Before(cutoff) && refilled >= l.burst {
 			delete(l.buckets, k)
 		}
 	}

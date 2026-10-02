@@ -34,7 +34,7 @@ func TestLimiterCleanupKeepsActiveAndUnrefilledBuckets(t *testing.T) {
 		"depleted": {tokens: 0, last: now.Add(-11 * time.Minute)},
 		"refilled": {tokens: 0, last: now.Add(-61 * time.Minute)},
 		"partial":  {tokens: 450, last: now.Add(-11 * time.Minute)},
-		"busy":     {tokens: 500, last: now.Add(-61 * time.Minute), busy: true},
+		"busy":     {tokens: 500, last: now.Add(-61 * time.Minute), active: 1},
 		"recent":   {tokens: 500, last: now.Add(-time.Minute)},
 	}
 	l.mu.Unlock()

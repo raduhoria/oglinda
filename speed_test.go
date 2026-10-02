@@ -15,15 +15,7 @@ import (
 )
 
 func testServer(cfg *config) *server {
-	return &server{
-		cfg:         cfg,
-		limit:       newLimiter(float64(cfg.perMinute), cfg.perMinute),
-		jobs:        make(semaphore, cfg.maxJobs),
-		speedLimit:  newLimiter(6, 6),
-		speedSem:    make(semaphore, cfg.speedJobs),
-		speedClient: newLimiter(float64(cfg.speedClientMB)/60, cfg.speedClientMB),
-		speedTotal:  newLimiter(float64(cfg.speedTotalMB), cfg.speedTotalMB),
-	}
+	return newServer(cfg)
 }
 
 func get(h http.HandlerFunc, url, remote string) int {
@@ -308,5 +300,67 @@ func TestRunBusyCostsNoToken(t *testing.T) {
 	}
 	if !s.limit.acquire("203.0.113.1") {
 		t.Fatal("a busy response cost the client its token")
+	}
+}
+
+func TestSpeedParallelStreams(t *testing.T) {
+	s := testServer(&config{speedMaxMB: 1, speedJobs: 8, speedStreams: 4, speedClientMB: 100, speedTotalMB: 100})
+	admit := func(remote string) (func(), int) {
+		r := httptest.NewRequest("GET", "/speed/down?mb=1", nil)
+		r.RemoteAddr = remote
+		w := httptest.NewRecorder()
+		release, ok := s.admitSpeed(w, r, 1)
+		if !ok {
+			return nil, w.Code
+		}
+		return release, 200
+	}
+
+	var releases []func()
+	for i := 0; i < 4; i++ {
+		release, code := admit("203.0.113.1:1000")
+		if code != 200 {
+			t.Fatalf("stream %d: %d", i+1, code)
+		}
+		releases = append(releases, release)
+	}
+	if _, code := admit("203.0.113.1:1000"); code != 429 {
+		t.Fatalf("fifth stream: %d, want 429", code)
+	}
+	// Another client still gets in while the first holds four slots.
+	other, code := admit("203.0.113.2:1000")
+	if code != 200 {
+		t.Fatalf("other client: %d", code)
+	}
+	other()
+
+	releases[0]()
+	if release, code := admit("203.0.113.1:1000"); code != 200 {
+		t.Fatalf("after release: %d", code)
+	} else {
+		release()
+	}
+	for _, release := range releases[1:] {
+		release()
+	}
+	if len(s.speedSem) != 0 {
+		t.Fatalf("%d slots still held", len(s.speedSem))
+	}
+}
+
+func TestSpeedStreamsShareGlobalSlots(t *testing.T) {
+	s := testServer(&config{speedMaxMB: 1, speedJobs: 2, speedStreams: 2, speedClientMB: 100, speedTotalMB: 100})
+	for i, remote := range []string{"203.0.113.1:1000", "203.0.113.1:1000"} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = remote
+		if _, ok := s.admitSpeed(httptest.NewRecorder(), r, 1); !ok {
+			t.Fatalf("stream %d refused", i+1)
+		}
+	}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "203.0.113.2:1000"
+	w := httptest.NewRecorder()
+	if _, ok := s.admitSpeed(w, r, 1); ok || w.Code != 503 {
+		t.Fatalf("global slots full: ok=%v code=%d, want 503", ok, w.Code)
 	}
 }
