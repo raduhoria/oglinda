@@ -1,3 +1,4 @@
 /oglinda
 *.env
 !deploy/*.env.example
+/.vscode/
