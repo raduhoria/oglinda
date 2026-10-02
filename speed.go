@@ -2,8 +2,10 @@ package main
 
 import (
 	"crypto/rand"
+	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
@@ -29,9 +31,22 @@ func (s *server) handleSpeedPing(w http.ResponseWriter, r *http.Request) {
 
 // GET /speed/down?mb=N — streams N MiB of random bytes.
 func (s *server) handleSpeedDown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		w.Header().Set("Connection", "close")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	mb, err := strconv.Atoi(r.URL.Query().Get("mb"))
 	if err != nil || mb < 1 || mb > s.cfg.speedMaxMB {
 		http.Error(w, "bad size", http.StatusBadRequest)
+		return
+	}
+	noStore(w)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(mb<<20))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	release, ok := s.admitSpeed(w, r, mb)
@@ -40,9 +55,6 @@ func (s *server) handleSpeedDown(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	noStore(w)
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(mb<<20))
 	rc := http.NewResponseController(w)
 	deadline := time.Now().Add(60 * time.Second)
 	for i := 0; i < mb; i++ {
@@ -56,9 +68,18 @@ func (s *server) handleSpeedDown(w http.ResponseWriter, r *http.Request) {
 // POST /speed/up — reads and discards the body, up to the size cap. The size
 // must be declared up front so it can be charged to the traffic budgets.
 func (s *server) handleSpeedUp(w http.ResponseWriter, r *http.Request) {
+	s.handleSpeedUpload(w, r, 60*time.Second, 5*time.Second)
+}
+
+func (s *server) handleSpeedUpload(w http.ResponseWriter, r *http.Request, totalTimeout, progressTimeout time.Duration) {
 	// If the upload is refused, close the connection instead of letting the
 	// server drain a body we did not want.
 	w.Header().Set("Connection", "close")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	size := r.ContentLength
 	if size < 1 || size > int64(s.cfg.speedMaxMB)<<20 {
 		http.Error(w, "bad size", http.StatusBadRequest)
@@ -72,14 +93,40 @@ func (s *server) handleSpeedUp(w http.ResponseWriter, r *http.Request) {
 
 	noStore(w)
 	r.Body = http.MaxBytesReader(w, r.Body, size)
-	http.NewResponseController(w).SetReadDeadline(time.Now().Add(60 * time.Second))
-	n, err := io.Copy(io.Discard, r.Body)
+	n, err := readUpload(w, r.Body, size, totalTimeout, progressTimeout)
 	if err != nil {
-		http.Error(w, "upload aborted", http.StatusRequestEntityTooLarge)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			http.Error(w, "upload timed out", http.StatusRequestTimeout)
+		} else {
+			http.Error(w, "upload aborted", http.StatusBadRequest)
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(strconv.FormatInt(n, 10)))
+}
+
+// Each block must arrive before its fixed deadline. A trickle of single bytes
+// cannot keep extending a block's wait, and all blocks share an absolute cap.
+func readUpload(w http.ResponseWriter, body io.Reader, size int64, totalTimeout, progressTimeout time.Duration) (int64, error) {
+	rc := http.NewResponseController(w)
+	totalDeadline := time.Now().Add(totalTimeout)
+	var buf [64 << 10]byte
+	var n int64
+	for n < size {
+		deadline := time.Now().Add(progressTimeout)
+		if totalDeadline.Before(deadline) {
+			deadline = totalDeadline
+		}
+		rc.SetReadDeadline(deadline)
+		count := min(int64(len(buf)), size-n)
+		read, err := io.ReadFull(body, buf[:int(count)])
+		n += int64(read)
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // admitSpeed admits a transfer of mb MiB: a global slot, a per-client turn,

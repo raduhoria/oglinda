@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func testServer(cfg *config) *server {
@@ -81,6 +87,215 @@ func TestSpeedUploadSize(t *testing.T) {
 		if w.Code != c.want {
 			t.Errorf("Content-Length %d: %d, want %d", c.length, w.Code, c.want)
 		}
+	}
+}
+
+func TestSpeedHeadDoesNotUseCapacityOrBudgets(t *testing.T) {
+	s := testServer(&config{speedMaxMB: 2, speedJobs: 1, speedClientMB: 2, speedTotalMB: 2})
+	s.speedSem.tryAcquire()
+	defer s.speedSem.release()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /speed/down", s.handleSpeedDown)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	for range 3 {
+		r, err := ts.Client().Head(ts.URL + "/speed/down?mb=2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil || r.StatusCode != http.StatusOK || len(body) != 0 || r.ContentLength != 2<<20 {
+			t.Fatalf("HEAD: status=%d, length=%d, body=%d, error=%v", r.StatusCode, r.ContentLength, len(body), err)
+		}
+		if r.Header.Get("Content-Type") != "application/octet-stream" || r.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("HEAD metadata: %v", r.Header)
+		}
+	}
+	for _, l := range []*limiter{s.speedLimit, s.speedClient, s.speedTotal} {
+		l.mu.Lock()
+		count := len(l.buckets)
+		l.mu.Unlock()
+		if count != 0 {
+			t.Fatalf("HEAD created %d limiter buckets", count)
+		}
+	}
+	if len(s.speedSem) != 1 {
+		t.Fatal("HEAD changed the occupied speed slot")
+	}
+}
+
+func TestSpeedTransferMethods(t *testing.T) {
+	s := testServer(&config{speedMaxMB: 1, speedJobs: 1, speedClientMB: 2, speedTotalMB: 2})
+	for _, c := range []struct {
+		handler http.HandlerFunc
+		method  string
+		path    string
+		allow   string
+	}{
+		{s.handleSpeedDown, "POST", "/speed/down?mb=1", "GET, HEAD"},
+		{s.handleSpeedUp, "GET", "/speed/up", "POST"},
+	} {
+		r := httptest.NewRequest(c.method, c.path, strings.NewReader("x"))
+		w := httptest.NewRecorder()
+		c.handler(w, r)
+		if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != c.allow {
+			t.Fatalf("%s %s: status=%d, Allow=%q", c.method, c.path, w.Code, w.Header().Get("Allow"))
+		}
+	}
+}
+
+func TestSpeedTransfers(t *testing.T) {
+	s := testServer(&config{speedMaxMB: 1, speedJobs: 1, speedClientMB: 2, speedTotalMB: 2})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /speed/down", s.handleSpeedDown)
+	mux.HandleFunc("POST /speed/up", s.handleSpeedUp)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	r, err := ts.Client().Get(ts.URL + "/speed/down?mb=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil || r.StatusCode != http.StatusOK || !bytes.Equal(body, payload) {
+		t.Fatalf("download: status=%d, bytes=%d, error=%v", r.StatusCode, len(body), err)
+	}
+	r, err = ts.Client().Post(ts.URL+"/speed/up", "application/octet-stream", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err = io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil || r.StatusCode != http.StatusOK || string(body) != "1048576" {
+		t.Fatalf("upload: status=%d, body=%q, error=%v", r.StatusCode, body, err)
+	}
+}
+
+type uploadReadSignal struct {
+	io.ReadCloser
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *uploadReadSignal) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	return b.ReadCloser.Read(p)
+}
+
+func TestSpeedUploadTimeoutReleasesSlot(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		size     int64
+		total    time.Duration
+		progress time.Duration
+		trickle  bool
+	}{
+		{"first byte", 1, 2 * time.Second, 100 * time.Millisecond, false},
+		{"trickled block", 64 << 10, 2 * time.Second, 120 * time.Millisecond, true},
+		{"absolute cap", 1, 100 * time.Millisecond, 2 * time.Second, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := testServer(&config{speedMaxMB: 1, speedJobs: 1, speedClientMB: 10, speedTotalMB: 10})
+			started := make(chan struct{})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/stall" {
+					r.Body = &uploadReadSignal{ReadCloser: r.Body, started: started}
+				}
+				s.handleSpeedUpload(w, r, c.total, c.progress)
+			}))
+			defer ts.Close()
+			conn, err := net.DialTimeout("tcp", strings.TrimPrefix(ts.URL, "http://"), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			began := time.Now()
+			if _, err := fmt.Fprintf(conn, "POST /stall HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n", c.size); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("upload did not start reading")
+			}
+			if len(s.speedSem) != 1 {
+				t.Fatal("stalled upload did not acquire the speed slot")
+			}
+			stop := make(chan struct{})
+			var writers sync.WaitGroup
+			if c.trickle {
+				writers.Add(1)
+				go func() {
+					defer writers.Done()
+					ticker := time.NewTicker(c.progress / 4)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-stop:
+							return
+						case <-ticker.C:
+							if _, err := conn.Write([]byte{'x'}); err != nil {
+								return
+							}
+						}
+					}
+				}()
+			}
+			defer func() { close(stop); conn.Close(); writers.Wait() }()
+			r, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = io.ReadAll(r.Body)
+			r.Body.Close()
+			if err != nil || r.StatusCode != http.StatusRequestTimeout || !r.Close {
+				t.Fatalf("timed out upload: status=%d, close=%v, error=%v", r.StatusCode, r.Close, err)
+			}
+			if elapsed := time.Since(began); elapsed >= time.Second {
+				t.Fatalf("upload ignored its short deadline: %s", elapsed)
+			}
+			if len(s.speedSem) != 0 {
+				t.Fatal("timed out upload kept its speed slot")
+			}
+			// The same client must be able to upload again after the timeout.
+			r, err = ts.Client().Post(ts.URL+"/complete", "text/plain", strings.NewReader("x"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(r.Body)
+			r.Body.Close()
+			if err != nil || r.StatusCode != http.StatusOK || string(body) != "1" {
+				t.Fatalf("subsequent upload: status=%d, body=%q, error=%v", r.StatusCode, body, err)
+			}
+		})
+	}
+}
+
+func TestSpeedUploadRefusalDoesNotDrainBody(t *testing.T) {
+	s := testServer(&config{speedMaxMB: 1, speedJobs: 1, speedClientMB: 2, speedTotalMB: 2})
+	s.speedSem.tryAcquire()
+	defer s.speedSem.release()
+	ts := httptest.NewServer(http.HandlerFunc(s.handleSpeedUp))
+	defer ts.Close()
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(ts.URL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(time.Second))
+	if _, err := io.WriteString(conn, "POST /speed/up HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil || r.StatusCode != http.StatusServiceUnavailable || !r.Close {
+		t.Fatalf("refused upload: status=%d, close=%v, error=%v", r.StatusCode, r.Close, err)
 	}
 }
 

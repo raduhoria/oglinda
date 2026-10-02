@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -138,6 +139,15 @@ type server struct {
 	speedTotal  *limiter
 }
 
+func (s *server) isTrustedProxy(peer netip.Addr) bool {
+	for _, p := range s.cfg.trustedProxy {
+		if p.Contains(peer.Unmap()) {
+			return true
+		}
+	}
+	return false
+}
+
 // clientIP trusts X-Forwarded-For only from a configured proxy, and then only
 // its right-most entry: the address the proxy itself saw.
 func (s *server) clientIP(r *http.Request) netip.Addr {
@@ -146,17 +156,13 @@ func (s *server) clientIP(r *http.Request) netip.Addr {
 		return netip.Addr{}
 	}
 	peer := ap.Addr().Unmap()
-	for _, p := range s.cfg.trustedProxy {
-		if p.Contains(peer) {
-			xff := r.Header.Values("X-Forwarded-For")
-			if len(xff) == 0 {
-				break
-			}
+	if s.isTrustedProxy(peer) {
+		xff := r.Header.Values("X-Forwarded-For")
+		if len(xff) != 0 {
 			parts := strings.Split(xff[len(xff)-1], ",")
 			if a, err := netip.ParseAddr(strings.TrimSpace(parts[len(parts)-1])); err == nil {
 				return a.Unmap()
 			}
-			break
 		}
 	}
 	return peer
@@ -203,6 +209,11 @@ func (s *server) handleInfo(w http.ResponseWriter, r *http.Request) {
 // Streams the output as server-sent events: "line" per output line, then a
 // single "done" or "error".
 func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	q := r.URL.Query()
 	name := q.Get("tool")
 	if _, ok := tools[name]; !ok {
@@ -242,8 +253,8 @@ func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The server's ReadTimeout would otherwise cancel the request context, and
-	// with it the tool, partway through a long traceroute.
+	// requestGuards has rejected GET bodies before admission. Extending the
+	// deadline is safe now and keeps ReadTimeout from cancelling a long tool.
 	rc := http.NewResponseController(w)
 	deadline := time.Now().Add(90 * time.Second)
 	rc.SetReadDeadline(deadline)
@@ -286,6 +297,80 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// sameOrigin permits command-line clients without browser headers, and browser
+// requests from this exact origin. Unlike http.CrossOriginProtection, the guard
+// also covers GET and HEAD: these endpoints start jobs and spend traffic budgets.
+func (s *server) sameOrigin(r *http.Request) bool {
+	if sites := r.Header.Values("Sec-Fetch-Site"); len(sites) != 0 {
+		if len(sites) != 1 || (sites[0] != "same-origin" && sites[0] != "none") {
+			return false
+		}
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	// Trust the public scheme only from the configured direct proxy. It must
+	// overwrite this header with one value and preserve the public Host.
+	if peer, err := netip.ParseAddrPort(r.RemoteAddr); err == nil && s.isTrustedProxy(peer.Addr()) {
+		if protos := r.Header.Values("X-Forwarded-Proto"); len(protos) != 0 {
+			if len(protos) != 1 || (protos[0] != "http" && protos[0] != "https") {
+				return false
+			}
+			scheme = protos[0]
+		}
+	}
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return true
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	origin, err := url.Parse(origins[0])
+	if err != nil || origin.User != nil || origin.Host == "" || origin.Opaque != "" ||
+		origin.Path != "" || origin.RawQuery != "" || origin.ForceQuery || origin.Fragment != "" ||
+		!strings.EqualFold(origin.Host, r.Host) {
+		return false
+	}
+	// X-Forwarded-Host is never used: the proxy must preserve the public Host.
+	return origin.Scheme == scheme
+}
+
+func (s *server) requestGuards(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			(r.ContentLength != 0 || len(r.TransferEncoding) != 0) {
+			// Do not read or close the body here: either can drain it and block.
+			// Closing the HTTP/1 connection makes the rejection immediate.
+			w.Header().Set("Connection", "close")
+			http.Error(w, "request body not allowed", http.StatusBadRequest)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/run", "/speed/down", "/speed/up":
+			if !s.sameOrigin(r) {
+				w.Header().Set("Connection", "close")
+				http.Error(w, "cross-origin request denied", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *server) handler() http.Handler {
+	static, _ := fs.Sub(webFS, "web")
+	mux := http.NewServeMux()
+	mux.Handle("GET /", http.FileServerFS(static))
+	mux.HandleFunc("GET /api/info", s.handleInfo)
+	mux.HandleFunc("GET /api/run", s.handleRun)
+	mux.HandleFunc("GET /speed/ping", s.handleSpeedPing)
+	mux.HandleFunc("GET /speed/down", s.handleSpeedDown)
+	mux.HandleFunc("POST /speed/up", s.handleSpeedUp)
+	return securityHeaders(s.requestGuards(mux))
+}
+
 func main() {
 	log.SetFlags(0)
 	cfg, err := loadConfig()
@@ -302,21 +387,12 @@ func main() {
 		speedTotal:  newLimiter(float64(cfg.speedTotalMB), cfg.speedTotalMB),
 	}
 
-	static, _ := fs.Sub(webFS, "web")
-	mux := http.NewServeMux()
-	mux.Handle("GET /", http.FileServerFS(static))
-	mux.HandleFunc("GET /api/info", s.handleInfo)
-	mux.HandleFunc("GET /api/run", s.handleRun)
-	mux.HandleFunc("GET /speed/ping", s.handleSpeedPing)
-	mux.HandleFunc("GET /speed/down", s.handleSpeedDown)
-	mux.HandleFunc("POST /speed/up", s.handleSpeedUp)
-
 	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	srv := &http.Server{
-		Handler:           securityHeaders(mux),
+		Handler:           s.handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bounds reading a request body, including the one the server drains
 		// after a handler that ignored it. Uploads extend their own deadline.

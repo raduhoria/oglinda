@@ -6,7 +6,7 @@ import (
 )
 
 // limiter is a per-key token bucket plus a per-key "one job at a time" lock.
-// Buckets are dropped once idle so the map cannot grow without bound.
+// Idle buckets are dropped only after their spent tokens have fully refilled.
 type limiter struct {
 	mu      sync.Mutex
 	rate    float64 // tokens per second
@@ -88,15 +88,23 @@ func (l *limiter) release(key string) {
 }
 
 func (l *limiter) gc() {
-	for range time.Tick(time.Minute) {
-		l.mu.Lock()
-		cutoff := time.Now().Add(-10 * time.Minute)
-		for k, b := range l.buckets {
-			if !b.busy && b.last.Before(cutoff) {
-				delete(l.buckets, k)
-			}
+	for now := range time.Tick(time.Minute) {
+		l.collect(now)
+	}
+}
+
+func (l *limiter) collect(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := now.Add(-10 * time.Minute)
+	for k, b := range l.buckets {
+		// Removing an exhausted hourly budget after ten minutes would grant
+		// a fresh burst on the next request. Evict only when recreating the
+		// bucket cannot increase the tokens available to the client.
+		refilled := b.tokens + now.Sub(b.last).Seconds()*l.rate
+		if !b.busy && b.last.Before(cutoff) && refilled >= l.burst {
+			delete(l.buckets, k)
 		}
-		l.mu.Unlock()
 	}
 }
 

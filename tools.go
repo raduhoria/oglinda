@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,18 +33,35 @@ var tools = map[string]tool{
 	},
 }
 
-var ipToken = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){2,7}\b`)
+// Match whole candidates, including compressed IPv6, embedded IPv4 and zones.
+// Letters outside the hexadecimal alphabet are included so an IP-shaped part
+// of a hostname or word is not accidentally treated as a separate address.
+var ipToken = regexp.MustCompile(`[\pL\pN_.:+-]+(?:%[\pL\pN_.@+-]+)?`)
 
 // maskInternal hides hops that are not publicly routable (the provider's
 // internal 10.x routers, etc.). They are noise to a visitor and only leak
 // internal topology.
 func maskInternal(line string) string {
 	return ipToken.ReplaceAllStringFunc(line, func(s string) string {
-		a, err := netip.ParseAddr(s)
-		if err != nil || isPublic(a, nil) {
+		// A final period or the colon after an address in ping output is
+		// punctuation. Parse first before stripping a colon: a trailing ::
+		// is part of a valid IPv6 address.
+		candidate := strings.TrimRight(s, ".")
+		a, err := netip.ParseAddr(candidate)
+		if err != nil {
+			if ap, portErr := netip.ParseAddrPort(candidate); portErr == nil {
+				a = ap.Addr()
+				candidate = candidate[:strings.LastIndexByte(candidate, ':')]
+				err = nil
+			} else {
+				candidate = strings.TrimSuffix(candidate, ":")
+				a, err = netip.ParseAddr(candidate)
+			}
+		}
+		if err != nil || isPublic(a.WithZone(""), nil) {
 			return s
 		}
-		return "[internal]"
+		return "[internal]" + s[len(candidate):]
 	})
 }
 

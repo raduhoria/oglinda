@@ -25,6 +25,7 @@ safe to run directly on a production host:
 | Bounded | Per-client token bucket (IPv6 grouped by /64), one job per client at a time, global job cap, hard timeouts on reading requests and on every test, output line cap. Speed transfers have their own size and concurrency limits, plus traffic budgets per client and for the whole server. |
 | Honest client IP | `X-Forwarded-For` is trusted only from configured proxies, and only its right-most entry. |
 | Strict browser policy | Strict CSP (`default-src 'none'`, no inline code), `nosniff`, no referrer, no framing. |
+| Request protection | Resource-consuming endpoints refuse cross-origin browser requests. GET and HEAD requests cannot carry a body. Uploads must deliver each 64 KiB block (or the final partial block) within five seconds. |
 | Small | One static Go binary with the web UI embedded. Standard library only, no third-party dependencies. |
 | No leaks | Internal hops (e.g. your provider's `10.x` routers) can be masked in traceroute output. |
 
@@ -54,6 +55,19 @@ lg.example.com {
 }
 ```
 
+The proxy must preserve the public `Host` and overwrite `X-Forwarded-For` and
+`X-Forwarded-Proto`. [Caddy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults)
+does this by default for the example above. Only configured
+trusted proxies may supply the forwarded client address and scheme. For nginx,
+set these [headers](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header)
+in the proxy location:
+
+```nginx
+proxy_set_header Host $http_host;
+proxy_set_header X-Forwarded-For $remote_addr;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
 ## Configuration
 
 Every option is an environment variable (see `deploy/oglinda.env.example`) or a flag
@@ -75,6 +89,12 @@ Every option is an environment variable (see `deploy/oglinda.env.example`) or a 
 | `LG_SPEED_CLIENT_MB` | `500` | Speed test traffic per client per hour, MiB |
 | `LG_SPEED_TOTAL_MB` | `1000` | Speed test traffic for all clients per minute, MiB |
 
+Traffic budgets are token buckets: each starts with the configured MiB allowance
+and replenishes at the stated rate. Transfers reserve their declared size up
+front, including incomplete transfers. Idle cleanup never resets a budget before
+it has fully replenished. Uploads have a 60-second total deadline as well as the
+five-second block deadline.
+
 ## API
 
 | | |
@@ -84,6 +104,11 @@ Every option is an environment variable (see `deploy/oglinda.env.example`) or a 
 | `GET /speed/ping` | Empty response, for RTT |
 | `GET /speed/down?mb=N` | N MiB of random data |
 | `POST /speed/up` | Discards the body, returns its size. Requires `Content-Length` |
+
+`HEAD /speed/down` returns size headers without consuming traffic budgets or
+transfer slots. `HEAD /api/run` is refused without starting a test. Browser
+requests to the test endpoints must come from the same origin; command-line
+clients without `Origin` or `Sec-Fetch-Site` headers can still use the API.
 
 ## License
 
