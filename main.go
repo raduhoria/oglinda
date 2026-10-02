@@ -40,6 +40,8 @@ type config struct {
 	maxJobs       int
 	speedMaxMB    int
 	speedJobs     int
+	speedClientMB int // per client, per hour
+	speedTotalMB  int // all clients, per minute
 }
 
 func env(key, def string) string {
@@ -94,7 +96,21 @@ func loadConfig() (*config, error) {
 	flag.IntVar(&c.maxJobs, "max-jobs", envInt("LG_MAX_JOBS", 4), "concurrent network tests, all clients")
 	flag.IntVar(&c.speedMaxMB, "speed-max-mb", envInt("LG_SPEED_MAX_MB", 100), "largest speed test transfer, MiB")
 	flag.IntVar(&c.speedJobs, "speed-jobs", envInt("LG_SPEED_JOBS", 3), "concurrent speed transfers, all clients")
+	flag.IntVar(&c.speedClientMB, "speed-client-mb", envInt("LG_SPEED_CLIENT_MB", 500), "speed test traffic per client per hour, MiB")
+	flag.IntVar(&c.speedTotalMB, "speed-total-mb", envInt("LG_SPEED_TOTAL_MB", 1000), "speed test traffic for all clients per minute, MiB")
 	flag.Parse()
+
+	for name, v := range map[string]int{
+		"per-minute": c.perMinute, "max-jobs": c.maxJobs, "speed-max-mb": c.speedMaxMB,
+		"speed-jobs": c.speedJobs, "speed-client-mb": c.speedClientMB, "speed-total-mb": c.speedTotalMB,
+	} {
+		if v < 1 {
+			return nil, fmt.Errorf("%s must be at least 1", name)
+		}
+	}
+	if c.speedMaxMB > c.speedClientMB || c.speedMaxMB > c.speedTotalMB {
+		return nil, fmt.Errorf("speed-max-mb must not exceed speed-client-mb or speed-total-mb")
+	}
 
 	var err error
 	if c.trustedProxy, err = parsePrefixes(trusted); err != nil {
@@ -117,6 +133,9 @@ type server struct {
 	jobs       semaphore
 	speedLimit *limiter
 	speedSem   semaphore
+	// MiB budgets for speed test traffic, per client and for all clients.
+	speedClient *limiter
+	speedTotal  *limiter
 }
 
 // clientIP trusts X-Forwarded-For only from a configured proxy, and then only
@@ -195,7 +214,14 @@ func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_family"})
 		return
 	}
-	// Rate limit before resolving, so DNS lookups count too.
+	// Take a global slot and a client token before resolving, so DNS lookups
+	// count against both limits. The slot comes first so that a busy server
+	// does not cost the client a token.
+	if !s.jobs.tryAcquire() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
+		return
+	}
+	defer s.jobs.release()
 	key := clientKey(s.clientIP(r))
 	if !s.limit.acquire(key) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})
@@ -216,14 +242,12 @@ func (s *server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.jobs.tryAcquire() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
-		return
-	}
-	defer s.jobs.release()
-
+	// The server's ReadTimeout would otherwise cancel the request context, and
+	// with it the tool, partway through a long traceroute.
 	rc := http.NewResponseController(w)
-	rc.SetWriteDeadline(time.Now().Add(90 * time.Second))
+	deadline := time.Now().Add(90 * time.Second)
+	rc.SetReadDeadline(deadline)
+	rc.SetWriteDeadline(deadline)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -269,11 +293,13 @@ func main() {
 		log.Fatal(err)
 	}
 	s := &server{
-		cfg:        cfg,
-		limit:      newLimiter(cfg.perMinute, cfg.perMinute),
-		jobs:       make(semaphore, cfg.maxJobs),
-		speedLimit: newLimiter(6, 6),
-		speedSem:   make(semaphore, cfg.speedJobs),
+		cfg:         cfg,
+		limit:       newLimiter(float64(cfg.perMinute), cfg.perMinute),
+		jobs:        make(semaphore, cfg.maxJobs),
+		speedLimit:  newLimiter(6, 6),
+		speedSem:    make(semaphore, cfg.speedJobs),
+		speedClient: newLimiter(float64(cfg.speedClientMB)/60, cfg.speedClientMB),
+		speedTotal:  newLimiter(float64(cfg.speedTotalMB), cfg.speedTotalMB),
 	}
 
 	static, _ := fs.Sub(webFS, "web")
@@ -292,8 +318,11 @@ func main() {
 	srv := &http.Server{
 		Handler:           securityHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    8 << 10,
+		// Bounds reading a request body, including the one the server drains
+		// after a handler that ignored it. Uploads extend their own deadline.
+		ReadTimeout:    10 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 8 << 10,
 	}
 	log.Printf("oglinda listening on %s", ln.Addr())
 	log.Fatal(srv.Serve(ln))

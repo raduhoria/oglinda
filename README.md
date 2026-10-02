@@ -22,7 +22,7 @@ safe to run directly on a production host:
 | Resolve, then run | The target is parsed or resolved to an IP first; only that IP is passed to the tool, after `--`. Hostnames cannot inject options, and DNS cannot change between check and use. |
 | Public targets only | Private, loopback, link-local, multicast, CGNAT, documentation, benchmarking and other reserved ranges are refused, for IPv4 and IPv6. You can block extra prefixes (`LG_BLOCK`). |
 | No privileges | Runs as a systemd `DynamicUser` with an empty capability set. ping uses unprivileged ICMP sockets, traceroute uses UDP. |
-| Bounded | Per-client token bucket (IPv6 grouped by /64), one job per client at a time, global job cap, hard timeouts, output line cap. Speed transfers have their own size and concurrency limits. |
+| Bounded | Per-client token bucket (IPv6 grouped by /64), one job per client at a time, global job cap, hard timeouts on reading requests and on every test, output line cap. Speed transfers have their own size and concurrency limits, plus traffic budgets per client and for the whole server. |
 | Honest client IP | `X-Forwarded-For` is trusted only from configured proxies, and only its right-most entry. |
 | Strict browser policy | Strict CSP (`default-src 'none'`, no inline code), `nosniff`, no referrer, no framing. |
 | Small | One static Go binary with the web UI embedded. Standard library only, no third-party dependencies. |
@@ -72,6 +72,8 @@ Every option is an environment variable (see `deploy/oglinda.env.example`) or a 
 | `LG_MAX_JOBS` | `4` | Concurrent network tests, all clients |
 | `LG_SPEED_MAX_MB` | `100` | Largest speed test transfer, MiB |
 | `LG_SPEED_JOBS` | `3` | Concurrent speed transfers, all clients |
+| `LG_SPEED_CLIENT_MB` | `500` | Speed test traffic per client per hour, MiB |
+| `LG_SPEED_TOTAL_MB` | `1000` | Speed test traffic for all clients per minute, MiB |
 
 ## API
 
@@ -81,7 +83,7 @@ Every option is an environment variable (see `deploy/oglinda.env.example`) or a 
 | `GET /api/run?tool=ping\|traceroute&family=4\|6&target=…` | Server-sent events: `target`, `line`…, then `done` or `error` |
 | `GET /speed/ping` | Empty response, for RTT |
 | `GET /speed/down?mb=N` | N MiB of random data |
-| `POST /speed/up` | Discards the body, returns its size |
+| `POST /speed/up` | Discards the body, returns its size. Requires `Content-Length` |
 
 ## License
 

@@ -24,6 +24,7 @@ var blockedPrefixes = mustPrefixes(
 	"100.64.0.0/10",   // CGNAT
 	"192.0.0.0/24",    // IETF protocol assignments
 	"192.0.2.0/24",    // TEST-NET-1
+	"192.88.99.0/24",  // deprecated 6to4 relay anycast
 	"198.18.0.0/15",   // benchmarking
 	"198.51.100.0/24", // TEST-NET-2
 	"203.0.113.0/24",  // TEST-NET-3
@@ -37,6 +38,8 @@ var blockedPrefixes = mustPrefixes(
 	"3fff::/20",       // documentation
 	"5f00::/16",       // SRv6 SIDs
 )
+
+var globalUnicast6 = netip.MustParsePrefix("2000::/3")
 
 func mustPrefixes(ss ...string) []netip.Prefix {
 	out := make([]netip.Prefix, 0, len(ss))
@@ -53,6 +56,11 @@ func isPublic(addr netip.Addr, extra []netip.Prefix) bool {
 		return false
 	}
 	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return false
+	}
+	// For IPv6, allow only the space IANA delegates for global unicast. This
+	// also rules out deprecated site-local fec0::/10 and unassigned space.
+	if addr.Is6() && !globalUnicast6.Contains(addr) {
 		return false
 	}
 	for _, p := range blockedPrefixes {

@@ -34,6 +34,10 @@ func TestResolveTargetLiterals(t *testing.T) {
 		{"fe80::1%eth0", 6, false},
 		{"fd00::1", 6, false},
 		{"2001:db8::1", 6, false},
+		{"fec0::1", 6, false},   // deprecated site-local
+		{"4000::1", 6, false},   // outside 2000::/3
+		{"::1.2.3.4", 6, false}, // IPv4-compatible
+		{"192.88.99.1", 4, false},
 		{"-c 1000 1.1.1.1", 4, false},
 		{"1.1.1.1; rm -rf /", 4, false},
 		{"$(id)", 4, false},

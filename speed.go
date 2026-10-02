@@ -34,7 +34,7 @@ func (s *server) handleSpeedDown(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad size", http.StatusBadRequest)
 		return
 	}
-	release, ok := s.admitSpeed(w, r)
+	release, ok := s.admitSpeed(w, r, mb)
 	if !ok {
 		return
 	}
@@ -53,16 +53,25 @@ func (s *server) handleSpeedDown(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /speed/up — reads and discards the body, up to the size cap.
+// POST /speed/up — reads and discards the body, up to the size cap. The size
+// must be declared up front so it can be charged to the traffic budgets.
 func (s *server) handleSpeedUp(w http.ResponseWriter, r *http.Request) {
-	release, ok := s.admitSpeed(w, r)
+	// If the upload is refused, close the connection instead of letting the
+	// server drain a body we did not want.
+	w.Header().Set("Connection", "close")
+	size := r.ContentLength
+	if size < 1 || size > int64(s.cfg.speedMaxMB)<<20 {
+		http.Error(w, "bad size", http.StatusBadRequest)
+		return
+	}
+	release, ok := s.admitSpeed(w, r, int((size+1<<20-1)>>20))
 	if !ok {
 		return
 	}
 	defer release()
 
 	noStore(w)
-	r.Body = http.MaxBytesReader(w, r.Body, int64(s.cfg.speedMaxMB)<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, size)
 	http.NewResponseController(w).SetReadDeadline(time.Now().Add(60 * time.Second))
 	n, err := io.Copy(io.Discard, r.Body)
 	if err != nil {
@@ -73,13 +82,30 @@ func (s *server) handleSpeedUp(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(strconv.FormatInt(n, 10)))
 }
 
-func (s *server) admitSpeed(w http.ResponseWriter, r *http.Request) (func(), bool) {
+// admitSpeed admits a transfer of mb MiB: a global slot, a per-client turn,
+// and mb from both the client's and the global traffic budget. The budgets
+// are charged up front and not refunded if the transfer stops early.
+func (s *server) admitSpeed(w http.ResponseWriter, r *http.Request, mb int) (func(), bool) {
 	key := clientKey(s.clientIP(r))
 	if !s.speedSem.tryAcquire() {
 		http.Error(w, "busy", http.StatusServiceUnavailable)
 		return nil, false
 	}
 	if !s.speedLimit.acquire(key) {
+		s.speedSem.release()
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return nil, false
+	}
+	cost := float64(mb)
+	if !s.speedTotal.spend("", cost) {
+		s.speedLimit.release(key)
+		s.speedSem.release()
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	if !s.speedClient.spend(key, cost) {
+		s.speedTotal.refund("", cost)
+		s.speedLimit.release(key)
 		s.speedSem.release()
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return nil, false

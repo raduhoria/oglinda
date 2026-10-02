@@ -20,9 +20,9 @@ type bucket struct {
 	busy   bool
 }
 
-func newLimiter(perMinute, burst int) *limiter {
+func newLimiter(perMinute float64, burst int) *limiter {
 	l := &limiter{
-		rate:    float64(perMinute) / 60,
+		rate:    perMinute / 60,
 		burst:   float64(burst),
 		buckets: make(map[string]*bucket),
 	}
@@ -30,11 +30,9 @@ func newLimiter(perMinute, burst int) *limiter {
 	return l
 }
 
-// acquire takes a token and marks key busy. It fails if the bucket is empty
-// or the key already has a job running. Call release when the job ends.
-func (l *limiter) acquire(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// refill returns key's bucket, topped up for the time since it was last used.
+// The caller holds l.mu.
+func (l *limiter) refill(key string) *bucket {
 	now := time.Now()
 	b, ok := l.buckets[key]
 	if !ok {
@@ -43,12 +41,42 @@ func (l *limiter) acquire(key string) bool {
 	}
 	b.tokens = min(l.burst, b.tokens+now.Sub(b.last).Seconds()*l.rate)
 	b.last = now
+	return b
+}
+
+// acquire takes a token and marks key busy. It fails if the bucket is empty
+// or the key already has a job running. Call release when the job ends.
+func (l *limiter) acquire(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.refill(key)
 	if b.busy || b.tokens < 1 {
 		return false
 	}
 	b.tokens--
 	b.busy = true
 	return true
+}
+
+// spend takes n tokens from key's bucket, or none if it holds fewer.
+// It is for budgets (e.g. MiB transferred) and ignores the busy flag.
+func (l *limiter) spend(key string, n float64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.refill(key)
+	if b.tokens < n {
+		return false
+	}
+	b.tokens -= n
+	return true
+}
+
+// refund returns n tokens taken by spend.
+func (l *limiter) refund(key string, n float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.refill(key)
+	b.tokens = min(l.burst, b.tokens+n)
 }
 
 func (l *limiter) release(key string) {
