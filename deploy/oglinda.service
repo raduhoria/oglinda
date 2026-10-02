@@ -39,6 +39,9 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# iputils ping drops privileges it does not have, via capset() and setuid().
+# With an empty bounding set and NoNewPrivileges neither can grant anything.
+SystemCallFilter=capset setuid
 UMask=0077
 
 MemoryMax=256M
