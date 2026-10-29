@@ -39,6 +39,8 @@ safe to run directly on a production host:
 - `net.ipv4.ping_group_range` covering all groups (the systemd default on modern
   distributions: `0 2147483647`)
 - A reverse proxy for TLS (Caddy, nginx)
+- To build: Go 1.21 or newer. `go.mod` pins the toolchain to go1.27.3, which
+  the `go` command downloads automatically (unless `GOTOOLCHAIN=local`).
 
 ## Install
 
